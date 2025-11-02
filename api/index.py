@@ -6,18 +6,25 @@ from flask import Flask, request, jsonify
 from flask_caching import Cache
 from youtube_search import YoutubeSearch
 import yt_dlp
+import concurrent.futures
+import functools
+import threading
+import time
 
 # -------------------------
-# Use Temp Directory for All File Operations (Vercel Compatibility)
+# Use Temp Directory for All File Operations (Vercel/Koyeb/Netlify compatibility)
 # -------------------------
 # Determine writable temp directory
 temp_dir = os.environ.get('TMPDIR', tempfile.gettempdir())
+# Ensure the temp dir exists
+os.makedirs(temp_dir, exist_ok=True)
+
 # Paths for cookie storage
 cookie_file = os.path.join(temp_dir, 'cookies.txt')
 cookies_file = cookie_file
 
 # -------------------------
-# Load Cookies and Patch requests.get
+# Load Cookies and Patch requests.get (unchanged)
 # -------------------------
 if os.path.exists(cookie_file):
     cookie_jar = MozillaCookieJar(cookie_file)
@@ -46,6 +53,15 @@ cache = Cache(app, config={
 })
 
 # -------------------------
+# Tuneable concurrency + sensible defaults
+# set YT_CONCURRENT_FRAGMENTS in env to control fragment concurrency
+# -------------------------
+DEFAULT_CONCURRENT_FRAGMENTS = int(os.environ.get('YT_CONCURRENT_FRAGMENTS', '3'))
+# Thread pool for running blocking yt_dlp tasks (keeps Flask worker threads free)
+YDLP_THREADPOOL_MAX_WORKERS = int(os.environ.get('YDLP_WORKERS', '4'))
+_ytdlp_executor = concurrent.futures.ThreadPoolExecutor(max_workers=YDLP_THREADPOOL_MAX_WORKERS)
+
+# -------------------------
 # Helper: Convert durations to ISO 8601
 # -------------------------
 def to_iso_duration(duration_str: str) -> str:
@@ -66,49 +82,85 @@ def to_iso_duration(duration_str: str) -> str:
 
 # -------------------------
 # yt-dlp Options and Extraction
+# - add: concurrent_fragment_downloads
+# - add: paths -> temp to ensure temporary fragments go to temp_dir
+# - keep cachedir False for ephemeral hosts
 # -------------------------
-ydl_opts_full = {
+common_ydl_opts = {
     'quiet': True,
+    'no_warnings': True,
     'skip_download': True,
     'format': 'bestvideo+bestaudio/best',
     'cookiefile': cookies_file,
-    # Disable filesystem caching or direct to temporary cache dir
-    'cachedir': False
-}
-ydl_opts_meta = {
-    'quiet': True,
-    'skip_download': True,
-    'simulate': True,
-    'noplaylist': True,
-    'cookiefile': cookies_file
+    'cachedir': False,
+    # make yt-dlp write temp/fragment files to our temp dir (avoid repo dir chaos)
+    'paths': {'temp': temp_dir},
+    # native concurrent fragment downloader setting (works for HLS/DASH)
+    'concurrent_fragment_downloads': DEFAULT_CONCURRENT_FRAGMENTS,
+    # do not print progress to keep stdout clean on serverless
+    'noprogress': True,
 }
 
-def extract_info(url=None, search_query=None, opts=None):
-    ydl_opts = opts or ydl_opts_full
+ydl_opts_full = dict(common_ydl_opts)
+# Keep original meta options but add concurrency & temp path
+ydl_opts_meta = dict(common_ydl_opts, simulate=True, noplaylist=True, skip_download=True)
+
+# -------------------------
+# Helper: run yt_dlp.extract_info in a threadpool with optional timeout
+# -------------------------
+def _run_extract_info(ydl_opts, target, download=False):
+    """
+    Blocking call to extract_info using the provided ydl options.
+    This runs inside a worker thread via executor below.
+    """
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        if search_query:
-            result = ydl.extract_info(f"ytsearch:{search_query}", download=False)
-            entries = result.get('entries')
+        return ydl.extract_info(target, download=download)
+
+def extract_info(url=None, search_query=None, opts=None, timeout=None):
+    """
+    Run yt-dlp extract_info on a threadpool worker.
+    - opts: yt-dlp options dict
+    - timeout: seconds to wait for result; if None, wait indefinitely.
+    Returns (info, err, code) similar to your original function.
+    """
+    ydl_opts = opts or ydl_opts_full
+    target = None
+    if search_query:
+        # for ytsearch: prefix the query as in CLI
+        target = f"ytsearch:{search_query}"
+    else:
+        target = url
+
+    future = _ytdlp_executor.submit(_run_extract_info, ydl_opts, target)
+    try:
+        info = future.result(timeout=timeout)
+        # If ytsearch returned a search result dict, the top-level structure can be search results:
+        if search_query and isinstance(info, dict) and 'entries' in info:
+            entries = info.get('entries') or []
             if not entries:
                 return None, {'error': 'No search results'}, 404
             return entries[0], None, None
-        else:
-            info = ydl.extract_info(url, download=False)
-            return info, None, None
+        return info, None, None
+    except concurrent.futures.TimeoutError:
+        # Cancel the running future if it did not finish in time; best-effort
+        future.cancel()
+        return None, {'error': 'yt-dlp timed out'}, 504
+    except yt_dlp.utils.DownloadError as e:
+        return None, {'error': str(e)}, 500
+    except Exception as e:
+        return None, {'error': str(e)}, 500
 
 # -------------------------
-# Format Helpers for yt-dlp
+# Format Helpers (unchanged)
 # -------------------------
 def get_size_bytes(fmt):
     return fmt.get('filesize') or fmt.get('filesize_approx') or 0
-
 
 def format_size(bytes_val):
     if bytes_val >= 1e9: return f"{bytes_val/1e9:.2f} GB"
     if bytes_val >= 1e6: return f"{bytes_val/1e6:.2f} MB"
     if bytes_val >= 1e3: return f"{bytes_val/1e3:.2f} KB"
     return f"{bytes_val} B"
-
 
 def build_formats_list(info):
     fmts = []
@@ -138,7 +190,8 @@ def build_formats_list(info):
     return fmts
 
 # -------------------------
-# Flask Routes (with Manual Caching)
+# Flask Routes (mostly unchanged) but using the threaded extract_info
+# - metadata endpoints use a short timeout to return fast (configurable)
 # -------------------------
 @app.route('/')
 def home():
@@ -151,8 +204,6 @@ def home():
     data = {'message': '✅ YouTube API is alive'}
     cache.set(key, data)
     return jsonify(data)
-
-
 
 @app.route('/api/fast-meta')
 def api_fast_meta():
@@ -179,8 +230,11 @@ def api_fast_meta():
                     'thumbnail': vid.get('thumbnails', [None])[0]
                 }
         else:
-            with yt_dlp.YoutubeDL(ydl_opts_meta) as ydl:
-                info = ydl.extract_info(u, download=False)
+            # Use a short timeout for metadata so endpoint returns fast (tunable)
+            meta_timeout = int(os.environ.get('META_TIMEOUT', '6'))  # seconds
+            info, err, code = extract_info(u, None, opts=ydl_opts_meta, timeout=meta_timeout)
+            if err:
+                return jsonify(err), code
             result = {
                 'title': info.get('title'),
                 'link': info.get('webpage_url'),
@@ -200,7 +254,9 @@ def api_all():
     u = request.args.get('url', '').strip()
     if not (q or u):
         return jsonify({'error': 'Provide "url" or "search"'}), 400
-    info, err, code = extract_info(u or None, q or None)
+    # For full info, allow a longer timeout (or None to wait indefinitely)
+    full_timeout = int(os.environ.get('FULL_INFO_TIMEOUT', '30'))  # seconds
+    info, err, code = extract_info(u or None, q or None, opts=ydl_opts_full, timeout=full_timeout)
     if err:
         return jsonify(err), code
     fmts = build_formats_list(info)
@@ -246,7 +302,8 @@ def api_meta():
         return jsonify(cached)
     if not (q or u):
         return jsonify({'error': 'Provide "url" or "search"'}), 400
-    info, err, code = extract_info(u or None, q or None, opts=ydl_opts_meta)
+    meta_timeout = int(os.environ.get('META_TIMEOUT', '6'))  # keep metadata quick
+    info, err, code = extract_info(u or None, q or None, opts=ydl_opts_meta, timeout=meta_timeout)
     if err:
         return jsonify(err), code
     keys = ['id','title','webpage_url','duration','upload_date',
@@ -270,8 +327,9 @@ def api_channel():
     if not (cid or cu):
         return jsonify({'error': 'Provide "url" or "id" parameter for channel'}), 400
     try:
-        with yt_dlp.YoutubeDL(ydl_opts_meta) as ydl:
-            info = ydl.extract_info(cid or cu, download=False)
+        info, err, code = extract_info(cid or cu, None, opts=ydl_opts_meta, timeout=20)
+        if err:
+            return jsonify(err), code
         data = {
             'id': info.get('id'),
             'name': info.get('uploader'),
@@ -299,8 +357,9 @@ def api_playlist():
     if not (pid or pu):
         return jsonify({'error': 'Provide "url" or "id" parameter for playlist'}), 400
     try:
-        with yt_dlp.YoutubeDL(ydl_opts_full) as ydl:
-            info = ydl.extract_info(pid or pu, download=False)
+        info, err, code = extract_info(pid or pu, None, opts=ydl_opts_full, timeout=60)
+        if err:
+            return jsonify(err), code
         videos = [{
             'id': e.get('id'),
             'title': e.get('title'),
@@ -319,6 +378,7 @@ def api_playlist():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+# Instagram/Twitter/TikTok/Facebook routes same pattern
 @app.route('/api/instagram')
 def api_instagram():
     u = request.args.get('url', '').strip()
@@ -331,8 +391,9 @@ def api_instagram():
     if not u:
         return jsonify({'error': 'Provide "url" parameter for Instagram'}), 400
     try:
-        with yt_dlp.YoutubeDL(ydl_opts_meta) as ydl:
-            info = ydl.extract_info(u, download=False)
+        info, err, code = extract_info(u, None, opts=ydl_opts_meta, timeout=20)
+        if err:
+            return jsonify(err), code
         cache.set(key, info)
         return jsonify(info)
     except Exception as e:
@@ -350,8 +411,9 @@ def api_twitter():
     if not u:
         return jsonify({'error': 'Provide "url" parameter for Twitter'}), 400
     try:
-        with yt_dlp.YoutubeDL(ydl_opts_meta) as ydl:
-            info = ydl.extract_info(u, download=False)
+        info, err, code = extract_info(u, None, opts=ydl_opts_meta, timeout=20)
+        if err:
+            return jsonify(err), code
         cache.set(key, info)
         return jsonify(info)
     except Exception as e:
@@ -369,8 +431,9 @@ def api_tiktok():
     if not u:
         return jsonify({'error': 'Provide "url" parameter for TikTok'}), 400
     try:
-        with yt_dlp.YoutubeDL(ydl_opts_meta) as ydv:
-            info = ydv.extract_info(u, download=False)
+        info, err, code = extract_info(u, None, opts=ydl_opts_meta, timeout=20)
+        if err:
+            return jsonify(err), code
         cache.set(key, info)
         return jsonify(info)
     except Exception as e:
@@ -388,8 +451,9 @@ def api_facebook():
     if not u:
         return jsonify({'error': 'Provide "url" parameter for Facebook'}), 400
     try:
-        with yt_dlp.YoutubeDL(ydl_opts_meta) as ydl:
-            info = ydl.extract_info(u, download=False)
+        info, err, code = extract_info(u, None, opts=ydl_opts_meta, timeout=20)
+        if err:
+            return jsonify(err), code
         cache.set(key, info)
         return jsonify(info)
     except Exception as e:
@@ -407,7 +471,8 @@ def api_download():
     search = request.args.get('search')
     if not (url or search):
         return jsonify({'error': 'Provide "url" or "search"'}), 400
-    info, err, code = extract_info(url, search)
+    # downloads require the full extract_info so give a generous timeout or none
+    info, err, code = extract_info(url, search, opts=ydl_opts_full, timeout=None)
     if err:
         return jsonify(err), code
     return jsonify({'formats': build_formats_list(info)})
@@ -418,7 +483,7 @@ def api_audio():
     search = request.args.get('search')
     if not (url or search):
         return jsonify({'error': 'Provide "url" or "search"'}), 400
-    info, err, code = extract_info(url, search)
+    info, err, code = extract_info(url, search, opts=ydl_opts_full, timeout=30)
     if err:
         return jsonify(err), code
     afmts = [f for f in build_formats_list(info) if f['kind'] in ('audio-only','progressive')]
@@ -430,10 +495,8 @@ def api_video():
     search = request.args.get('search')
     if not (url or search):
         return jsonify({'error': 'Provide "url" or "search"'}), 400
-    info, err, code = extract_info(url, search)
+    info, err, code = extract_info(url, search, opts=ydl_opts_full, timeout=30)
     if err:
         return jsonify(err), code
     vfmts = [f for f in build_formats_list(info) if f['kind'] in ('video-only','progressive')]
     return jsonify({'video_formats': vfmts})
-
-
